@@ -1,5 +1,5 @@
 //
-// Created by Kritartha Ghosh on 2019-04-30.
+// Created by Kritartha Ghosh on 2019-05-01.
 //
 
 #include <cstdio>
@@ -53,6 +53,8 @@ std::string getInstructionLabel(const Instruction *Node);
 
 std::set<std::pair <std::string,int>> getMaxSeparation(BBANALYSIS bbAnalysis);
 
+bool getBranches(BBANALYSIS bbAnalysis, const ICmpInst* I, bool trueBranch);
+
 int main(int argc, char **argv) {
     static LLVMContext Context;
     SMDiagnostic Err;
@@ -91,8 +93,33 @@ int main(int argc, char **argv) {
         // Passing the interval values to the children.
         const TerminatorInst *TInst = BB->getTerminator();
         int NSucc = TInst->getNumSuccessors();
-        for (int i = 0; i < NSucc; ++i) {
-            BasicBlock * Succ = TInst->getSuccessor(i);
+        if (NSucc == 0) continue;
+
+        if(NSucc == 2) {
+            const ICmpInst *CmpInst = llvm::dyn_cast<ICmpInst>(TInst->getPrevNode());
+            if(getBranches(currentBlockAnalysis, CmpInst, true)) {
+                BasicBlock * Succ = TInst->getSuccessor(0);
+                BBANALYSIS oldAnalysisMap = analysisMap[getSimpleNodeLabel(Succ)];
+                BBANALYSIS newAnalysisMap = unionAnalysis(oldAnalysisMap, currentBlockAnalysis);
+
+                if (!fixPointReached(oldAnalysisMap, newAnalysisMap)) {
+                    analysisMap[getSimpleNodeLabel(Succ)] = newAnalysisMap;
+                    traversalStack.push(Succ);
+                }
+            }
+
+            if(getBranches(currentBlockAnalysis, CmpInst, false)) {
+                BasicBlock * Succ = TInst->getSuccessor(1);
+                BBANALYSIS oldAnalysisMap = analysisMap[getSimpleNodeLabel(Succ)];
+                BBANALYSIS newAnalysisMap = unionAnalysis(oldAnalysisMap, currentBlockAnalysis);
+
+                if (!fixPointReached(oldAnalysisMap, newAnalysisMap)) {
+                    analysisMap[getSimpleNodeLabel(Succ)] = newAnalysisMap;
+                    traversalStack.push(Succ);
+                }
+            }
+        } else if(NSucc == 1) {
+            BasicBlock * Succ = TInst->getSuccessor(0);
             BBANALYSIS oldAnalysisMap = analysisMap[getSimpleNodeLabel(Succ)];
             BBANALYSIS newAnalysisMap = unionAnalysis(oldAnalysisMap, currentBlockAnalysis);
 
@@ -213,11 +240,8 @@ DataInfo evaluateOperators(std::string opCode, DataInfo obj1, DataInfo obj2) {
         if(obj1.max == POS_INFINITY || obj2.max == POS_INFINITY) obj.max = POS_INFINITY;
         else obj.max = obj1.max + obj2.max;
     } else if (opCode.compare("sub") == 0) {
-        if(obj1.min == NEG_INFINITY || obj2.min == NEG_INFINITY) obj.min = NEG_INFINITY;
-        else obj.min = obj1.min - obj2.min;
-
-        if(obj1.max == POS_INFINITY || obj2.max == POS_INFINITY) obj.max = POS_INFINITY;
-        else obj.max = obj1.max - obj2.max;
+        obj.min = obj1.min - obj2.min;
+        obj.max = obj1.max - obj2.max;
     } else if (opCode.compare("mul") == 0) {
         int o1 = obj1.min * obj2.min;
         int o2 = obj1.max * obj2.max;
@@ -273,7 +297,7 @@ std::set<std::pair <std::string,int>> getMaxSeparation(BBANALYSIS bbAnalysis) {
                     if(str1 != str2 && str1.compare(str2) > 0) {
                         if(obj1.min == NEG_INFINITY || obj1.max == POS_INFINITY || obj2.min == NEG_INFINITY || obj2.max == POS_INFINITY) {
                             std::string str = "[" + str1 + ", " + str2 + "]";
-                            maxSet.insert(std::make_pair(str, POS_INFINITY));    
+                            maxSet.insert(std::make_pair(str, POS_INFINITY));
                         } else {
                             int diff = std::max(std::abs(obj1.max - obj2.min), std::abs(obj1.min - obj2.max));
                             std::string str = "[" + str1 + ", " + str2 + "]";
@@ -285,6 +309,51 @@ std::set<std::pair <std::string,int>> getMaxSeparation(BBANALYSIS bbAnalysis) {
         }
     }
     return maxSet;
+}
+
+bool getBranches(BBANALYSIS bbAnalysis, const ICmpInst* I, bool trueBranch) {
+    ICmpInst::Predicate predicate = I->getPredicate();
+
+    Value* v1 = I->getOperand(0);
+    Value* v2 = I->getOperand(1);
+    Instruction* source = llvm::dyn_cast<Instruction>(v1);
+    Instruction* target = llvm::dyn_cast<Instruction>(v2);
+
+    DataInfo op1;
+    if (isa<ConstantInt>(v1)) {
+        auto *constant = dyn_cast<ConstantInt>(v1);
+        int val = constant->getSExtValue();
+        op1.min = val;
+        op1.max = val;
+    } else op1 = bbAnalysis.find(source)->second;
+
+    DataInfo op2;
+    if (isa<ConstantInt>(v2)) {
+        auto *constant = dyn_cast<ConstantInt>(v2);
+        int val = constant->getSExtValue();
+        op2.min = val;
+        op2.max = val;
+    } else op2 = bbAnalysis.find(target)->second;
+
+    if(predicate == ICmpInst::ICMP_EQ) {
+        if(trueBranch) return (op1.min == op2.min || op1.min == op2.max || op1.max == op2.min || op1.max == op2.max);
+        else return !(op1.min == op2.min && op1.min == op2.max && op1.max == op2.min && op1.max == op2.max);
+    } else if (predicate == ICmpInst::ICMP_NE) {
+        if(trueBranch) return (op1.min != op2.min || op1.min != op2.max || op1.max != op2.min || op1.max != op2.max);
+        else return !(op1.min != op2.min && op1.min != op2.max && op1.max != op2.min && op1.max != op2.max);
+    } else if (predicate == ICmpInst::ICMP_SGT) {
+        if(trueBranch) return (op1.min > op2.min || op1.min > op2.max || op1.max > op2.min || op1.max > op2.max);
+        else return !(op1.min > op2.min && op1.min > op2.max && op1.max > op2.min && op1.max > op2.max);
+    } else if (predicate == ICmpInst::ICMP_SGE) {
+        if(trueBranch) return (op1.min >= op2.min || op1.min >= op2.max || op1.max >= op2.min || op1.max >= op2.max);
+        else return !(op1.min >= op2.min && op1.min >= op2.max && op1.max >= op2.min && op1.max >= op2.max);
+    } else if (predicate == ICmpInst::ICMP_SLT) {
+        if(trueBranch) return (op1.min < op2.min || op1.min < op2.max || op1.max < op2.min || op1.max < op2.max);
+        else return (op1.min < op2.min && op1.min < op2.max && op1.max < op2.min && op1.max < op2.max);
+    } else if (predicate == ICmpInst::ICMP_SLE) {
+        if(trueBranch) return (op1.min <= op2.min || op1.min <= op2.max || op1.max <= op2.min || op1.max <= op2.max);
+        else return (op1.min <= op2.min && op1.min <= op2.max && op1.max <= op2.min && op1.max <= op2.max);
+    } else return trueBranch;
 }
 
 // Printing Basic Block Label
@@ -310,10 +379,10 @@ void printAnalysisMap(std::map<std::string, BBANALYSIS> analysisMap) {
         BBANALYSIS bbAnalysis = row.second;
         outs() << BBLabel << ":\n";
 
-        std::set<std::pair <std::string,int>> maxSet = getMaxSeparation(row.second);
-        for (auto maxPair : maxSet) {
-            std::string diff = maxPair.second == POS_INFINITY || maxPair.second == NEG_INFINITY || maxPair.first == "" ? "+Infinity": std::to_string(maxPair.second);
-            outs() << "Max-Separation:" << maxPair.first << ": " << diff << "\n" << "\n";
+        for (auto &x : bbAnalysis) {
+            std::string min = x.second.min == NEG_INFINITY ? "-Infinity": std::to_string(x.second.min);
+            std::string max = x.second.max == POS_INFINITY ? "+Infinity": std::to_string(x.second.max);
+            std::cout << getInstructionLabel(x.first) << '[' << min << ',' << max << ']' << std::endl;
         }
         outs() << "\n";
     }
